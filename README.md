@@ -396,7 +396,7 @@ The MIT License (MIT). Please see [License File](LICENSE.md) for more informatio
 
 ## 🙏 Credits
 
-- [Alek Habib](https://github.com/yourusername)
+- [Alee Khabib](https://github.com/yourusername)
 - Inspired by the need for RoadRunner + Laravel Queue harmony
 - All contributors who helped make this package better
 
