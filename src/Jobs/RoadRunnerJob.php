@@ -137,9 +137,14 @@ abstract class RoadRunnerJob implements ShouldQueue
                 // Call failed() method if exists
                 if (method_exists($this, 'failed')) {
                     try {
+                        Log::info('🔧 Calling failed() handler', [
+                            'job_class' => get_class($this),
+                            'job_id' => $jobId,
+                        ]);
+                        
                         $this->failed($exception);
                         
-                        Log::info('✅ failed() handler executed', [
+                        Log::info('✅ failed() handler executed successfully', [
                             'job_class' => get_class($this),
                             'job_id' => $jobId,
                         ]);
@@ -148,8 +153,17 @@ abstract class RoadRunnerJob implements ShouldQueue
                             'job_class' => get_class($this),
                             'job_id' => $jobId,
                             'error' => $failedException->getMessage(),
+                            'trace' => $failedException->getTraceAsString(),
                         ]);
+                        
+                        // Don't let failed() error stop the process
+                        // Continue to insert to failed_jobs
                     }
+                } else {
+                    Log::warning('⚠️ No failed() method found', [
+                        'job_class' => get_class($this),
+                        'job_id' => $jobId,
+                    ]);
                 }
                 
                 // Insert to failed_jobs table
@@ -242,25 +256,9 @@ abstract class RoadRunnerJob implements ShouldQueue
      */
     protected function retryJob(int $delay): void
     {
-        // Create new instance with same properties
-        $jobClass = get_class($this);
-        $properties = get_object_vars($this);
-        
-        // Remove framework properties
-        unset(
-            $properties['job'],
-            $properties['connection'],
-            $properties['chainConnection'],
-            $properties['chainQueue'],
-            $properties['chainCatchCallbacks'],
-            $properties['delay'],
-            $properties['afterCommit'],
-            $properties['middleware'],
-            $properties['chained']
-        );
-        
-        // Create new job instance
-        $newJob = new $jobClass(...array_values($properties));
+        // Serialize and unserialize to create exact copy
+        $serialized = serialize($this);
+        $newJob = unserialize($serialized);
         
         // Dispatch with delay
         dispatch($newJob)

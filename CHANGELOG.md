@@ -2,6 +2,18 @@
 
 All notable changes to `laravel-roadrunner-queue` will be documented in this file.
 
+## [1.0.1] - 2026-01-30
+
+### Fixed
+- 🐛 **CRITICAL:** Fixed job ID changing on retry due to incorrect parameter reconstruction in `retryJob()` method
+- Changed from `array_values()` reconstruction to `serialize/unserialize` for exact object copy
+- Job properties now correctly preserved across retries
+
+### Impact
+- Job retry now works correctly with same job ID across all attempts
+- Attempt counter no longer resets
+- All job properties maintained during retry
+
 ## [1.0.0] - 2026-01-29
 
 ### Added

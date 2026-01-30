@@ -388,7 +388,7 @@ Please see [CHANGELOG](CHANGELOG.md) for more information on what has changed re
 
 ## 🔒 Security
 
-If you discover any security related issues, please email ebects@gmail.com instead of using the issue tracker.
+If you discover any security related issues, please email security@example.com instead of using the issue tracker.
 
 ## 📄 License
 
@@ -396,7 +396,7 @@ The MIT License (MIT). Please see [License File](LICENSE.md) for more informatio
 
 ## 🙏 Credits
 
-- [Alee Khabib](https://github.com/yourusername)
+- [Alek Habib](https://github.com/yourusername)
 - Inspired by the need for RoadRunner + Laravel Queue harmony
 - All contributors who helped make this package better
 
