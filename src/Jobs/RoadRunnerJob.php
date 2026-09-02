@@ -58,121 +58,127 @@ abstract class RoadRunnerJob implements ShouldQueue
     {
         $jobId = $this->getJobIdentifier();
         $attemptKey = $this->getAttemptKey($jobId);
-        
-        // Track current attempt
-        $currentAttempt = Cache::get($attemptKey, 0) + 1;
-        Cache::put($attemptKey, $currentAttempt, now()->addDay());
-        
-        // Get max tries
-        $maxTries = $this->tries;
-        
-        // Log job start
-        Log::info('🚀 Job STARTED', [
+
+        $this->logLifecycle('debug', 'Job STARTED', [
             'job_class' => get_class($this),
             'job_id' => $jobId,
-            'attempt' => $currentAttempt,
-            'max_tries' => $maxTries,
-            'queue' => $this->queue ?? 'default',
+            'max_tries' => $this->tries,
+            'queue' => $this->resolveQueue(),
         ]);
-        
-        // Set timeout if configured
+
         if ($this->timeout > 0) {
             set_time_limit($this->timeout);
         }
-        
+
         try {
-            // Call child class's process() method
             $this->process();
-            
-            // Success! Clear attempt counter
-            Cache::forget($attemptKey);
-            
-            Log::info('✅ Job COMPLETED', [
-                'job_class' => get_class($this),
-                'job_id' => $jobId,
-                'attempt' => $currentAttempt,
-            ]);
-            
         } catch (\Throwable $exception) {
-            // Log error
-            Log::error('❌ Job FAILED', [
+            $this->handleFailure($jobId, $attemptKey, $exception);
+
+            return;
+        }
+
+        $this->forgetAttempt($attemptKey);
+
+        $this->callHook(fn () => $this->afterSuccess(), 'afterSuccess');
+
+        $this->logLifecycle('debug', 'Job COMPLETED', [
+            'job_class' => get_class($this),
+            'job_id' => $jobId,
+        ]);
+    }
+
+    /**
+     * Run a user-supplied lifecycle hook without letting it change the outcome
+     * of a job that has already succeeded or already been marked for retry.
+     */
+    private function callHook(callable $hook, string $name): void
+    {
+        try {
+            $hook();
+        } catch (\Throwable $e) {
+            $this->resolveLogger()->error("Error in {$name}() hook", [
+                'job_class' => get_class($this),
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Decide between retry and final failure.
+     *
+     * This method never rethrows: the job has already been consumed and any
+     * further retry is driven by re-dispatch, not by the broker.
+     */
+    private function handleFailure(string $jobId, string $attemptKey, \Throwable $exception): void
+    {
+        $maxTries = max(1, (int) $this->tries);
+        $attempt = $this->rememberAttempt($attemptKey);
+        $canRetry = $attempt !== null && $attempt < $maxTries;
+
+        $this->resolveLogger()->error('Job FAILED', [
+            'job_class' => get_class($this),
+            'job_id' => $jobId,
+            'attempt' => $attempt,
+            'max_tries' => $maxTries,
+            'will_retry' => $canRetry,
+            'message' => $exception->getMessage(),
+            'file' => $exception->getFile(),
+            'line' => $exception->getLine(),
+        ]);
+
+        if ($canRetry) {
+            $delay = $this->getRetryDelay($attempt);
+
+            $this->callHook(fn () => $this->beforeRetry($attempt), 'beforeRetry');
+
+            $this->retryJob($delay);
+
+            $this->logLifecycle('info', 'Job scheduled for RETRY', [
                 'job_class' => get_class($this),
                 'job_id' => $jobId,
-                'attempt' => $currentAttempt,
+                'current_attempt' => $attempt,
+                'next_attempt' => $attempt + 1,
                 'max_tries' => $maxTries,
-                'will_retry' => $currentAttempt < $maxTries,
-                'message' => $exception->getMessage(),
-                'file' => $exception->getFile(),
-                'line' => $exception->getLine(),
+                'delay_seconds' => $delay,
+                'retry_at' => now()->addSeconds($delay)->toDateTimeString(),
             ]);
-            
-            // Check if should retry
-            if ($currentAttempt < $maxTries) {
-                // Calculate retry delay
-                $delay = $this->getRetryDelay($currentAttempt);
-                
-                // Re-dispatch job with delay
-                $this->retryJob($delay);
-                
-                Log::info('🔄 Job scheduled for RETRY', [
-                    'job_class' => get_class($this),
-                    'job_id' => $jobId,
-                    'current_attempt' => $currentAttempt,
-                    'next_attempt' => $currentAttempt + 1,
-                    'max_tries' => $maxTries,
-                    'delay_seconds' => $delay,
-                    'retry_at' => now()->addSeconds($delay)->toDateTimeString(),
-                ]);
-                
-            } else {
-                // Max retries reached
-                Cache::forget($attemptKey);
-                
-                Log::error('🔴 Job FINAL FAILURE (max retries reached)', [
-                    'job_class' => get_class($this),
-                    'job_id' => $jobId,
-                    'total_attempts' => $currentAttempt,
-                ]);
-                
-                // Call failed() method if exists
-                if (method_exists($this, 'failed')) {
-                    try {
-                        Log::info('🔧 Calling failed() handler', [
-                            'job_class' => get_class($this),
-                            'job_id' => $jobId,
-                        ]);
-                        
-                        $this->failed($exception);
-                        
-                        Log::info('✅ failed() handler executed successfully', [
-                            'job_class' => get_class($this),
-                            'job_id' => $jobId,
-                        ]);
-                    } catch (\Throwable $failedException) {
-                        Log::error('❌ Error in failed() handler', [
-                            'job_class' => get_class($this),
-                            'job_id' => $jobId,
-                            'error' => $failedException->getMessage(),
-                            'trace' => $failedException->getTraceAsString(),
-                        ]);
-                        
-                        // Don't let failed() error stop the process
-                        // Continue to insert to failed_jobs
-                    }
-                } else {
-                    Log::warning('⚠️ No failed() method found', [
-                        'job_class' => get_class($this),
-                        'job_id' => $jobId,
-                    ]);
-                }
-                
-                // Insert to failed_jobs table
-                $this->insertToFailedJobs($jobId, $exception);
-            }
-            
-            // Always re-throw so RR knows job failed
-            throw $exception;
+
+            return;
         }
+
+        // A null attempt means the counter store is unreachable. Retrying blind
+        // would loop forever, so the job is failed now and stays recoverable
+        // through the failed_jobs table.
+        if ($attempt === null) {
+            $this->resolveLogger()->warning('Attempt counter unavailable, failing job without retry', [
+                'job_class' => get_class($this),
+                'job_id' => $jobId,
+            ]);
+        }
+
+        $this->forgetAttempt($attemptKey);
+
+        $this->resolveLogger()->error('Job FINAL FAILURE', [
+            'job_class' => get_class($this),
+            'job_id' => $jobId,
+            'total_attempts' => $attempt,
+        ]);
+
+        if (method_exists($this, 'failed')) {
+            try {
+                $this->failed($exception);
+            } catch (\Throwable $failedException) {
+                $this->resolveLogger()->error('Error in failed() handler', [
+                    'job_class' => get_class($this),
+                    'job_id' => $jobId,
+                    'error' => $failedException->getMessage(),
+                    'trace' => $failedException->getTraceAsString(),
+                ]);
+            }
+        }
+
+        $this->insertToFailedJobs($jobId, $exception);
     }
 
     /**
@@ -221,7 +227,72 @@ abstract class RoadRunnerJob implements ShouldQueue
      */
     protected function getAttemptKey(string $jobId): string
     {
-        return "rr_job_attempt:{$jobId}";
+        return config('roadrunner-queue.cache_prefix', 'rr_job_attempt:').$jobId;
+    }
+
+    /**
+     * Increment and persist the attempt counter.
+     *
+     * Returns null when the cache store cannot be read or written, which the
+     * caller treats as "retry budget unknown" rather than as a job failure.
+     */
+    private function rememberAttempt(string $attemptKey): ?int
+    {
+        try {
+            $attempt = ((int) Cache::get($attemptKey, 0)) + 1;
+
+            Cache::put($attemptKey, $attempt, (int) config('roadrunner-queue.attempt_ttl', 86400));
+
+            return $attempt;
+        } catch (\Throwable $e) {
+            $this->resolveLogger()->warning('Unable to track job attempt', [
+                'job_class' => get_class($this),
+                'attempt_key' => $attemptKey,
+                'error' => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    private function forgetAttempt(string $attemptKey): void
+    {
+        try {
+            Cache::forget($attemptKey);
+        } catch (\Throwable $e) {
+            $this->resolveLogger()->warning('Unable to clear job attempt counter', [
+                'job_class' => get_class($this),
+                'attempt_key' => $attemptKey,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * The queue this job came from, or null when it is unknown.
+     *
+     * Guessing a queue name here would silently publish the retry to a pipeline
+     * nobody consumes, so callers are expected to handle null explicitly.
+     */
+    private function resolveQueue(): ?string
+    {
+        return $this->queue ?: null;
+    }
+
+    private function resolveLogger(): \Psr\Log\LoggerInterface
+    {
+        $channel = config('roadrunner-queue.logging.channel');
+
+        return $channel ? Log::channel($channel) : Log::getFacadeRoot();
+    }
+
+    private function logLifecycle(string $level, string $message, array $context = []): void
+    {
+        if (! config('roadrunner-queue.logging.enabled', true)) {
+            return;
+        }
+
+        $this->resolveLogger()->log($level, $message, $context);
     }
 
     /**
@@ -256,14 +327,13 @@ abstract class RoadRunnerJob implements ShouldQueue
      */
     protected function retryJob(int $delay): void
     {
-        // Serialize and unserialize to create exact copy
-        $serialized = serialize($this);
-        $newJob = unserialize($serialized);
-        
-        // Dispatch with delay
-        dispatch($newJob)
-            ->onQueue($this->queue ?? 'default')
-            ->delay(now()->addSeconds($delay));
+        $newJob = unserialize(serialize($this));
+
+        $pending = dispatch($newJob)->delay(now()->addSeconds($delay));
+
+        if ($queue = $this->resolveQueue()) {
+            $pending->onQueue($queue);
+        }
     }
 
     /**
@@ -271,11 +341,14 @@ abstract class RoadRunnerJob implements ShouldQueue
      */
     protected function insertToFailedJobs(string $jobId, \Throwable $exception): void
     {
+        $connection = $this->connection ?: config('queue.default');
+
         try {
             DB::table('failed_jobs')->insert([
                 'uuid' => (string) Str::uuid(),
-                'connection' => 'rabbitmq',
-                'queue' => $this->queue ?? 'default',
+                'connection' => $connection,
+                'queue' => $this->resolveQueue()
+                    ?? config("queue.connections.{$connection}.queue", 'default'),
                 'payload' => json_encode([
                     'displayName' => get_class($this),
                     'job' => serialize($this),
@@ -288,13 +361,13 @@ abstract class RoadRunnerJob implements ShouldQueue
                 'failed_at' => now(),
             ]);
             
-            Log::info('📝 Inserted to failed_jobs table', [
+            $this->logLifecycle('info', 'Inserted to failed_jobs table', [
                 'job_class' => get_class($this),
                 'job_id' => $jobId,
             ]);
-            
+
         } catch (\Throwable $e) {
-            Log::error('Failed to insert to failed_jobs', [
+            $this->resolveLogger()->error('Failed to insert to failed_jobs', [
                 'job_class' => get_class($this),
                 'job_id' => $jobId,
                 'error' => $e->getMessage(),
@@ -307,9 +380,13 @@ abstract class RoadRunnerJob implements ShouldQueue
      */
     protected function currentAttempt(): int
     {
-        $jobId = $this->getJobIdentifier();
-        $attemptKey = $this->getAttemptKey($jobId);
-        return Cache::get($attemptKey, 1);
+        $attemptKey = $this->getAttemptKey($this->getJobIdentifier());
+
+        try {
+            return ((int) Cache::get($attemptKey, 0)) + 1;
+        } catch (\Throwable $e) {
+            return 1;
+        }
     }
 
     /**
